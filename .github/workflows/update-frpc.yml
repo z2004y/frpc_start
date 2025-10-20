@@ -2,36 +2,59 @@ name: Update frpc.exe
 
 on:
   schedule:
-    - cron: "0 3 * * 1"   # 每周一凌晨3点执行
-  workflow_dispatch:       # 允许手动触发
+    - cron: "0 3 * * 1"        # 每周一 03:00（UTC）运行
+  workflow_dispatch:
+
+permissions:
+  contents: write               # 关键：允许写入仓库内容（commit/push）
 
 jobs:
   update-frpc:
     runs-on: windows-latest
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # 保留历史，避免稀奇问题
+          persist-credentials: true
 
-      - name: Download latest FRP release
+      - name: Download latest FRP (windows_amd64)
         shell: pwsh
         run: |
-          # 获取最新版本号
           $latest = Invoke-RestMethod https://api.github.com/repos/fatedier/frp/releases/latest
-          $version = $latest.tag_name
-          Write-Output "Latest version: $version"
+          $asset = $latest.assets | Where-Object { $_.name -match "windows_amd64\.zip$" } | Select-Object -First 1
+          if (-not $asset) { throw "Cannot find windows_amd64 asset in latest release." }
 
-          # 下载 Windows amd64 压缩包
-          $url = $latest.assets | Where-Object { $_.name -match "windows_amd64.zip" } | Select-Object -ExpandProperty browser_download_url
-          Invoke-WebRequest -Uri $url -OutFile frp.zip
+          Write-Host "Latest tag: $($latest.tag_name)"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile frp.zip
 
-          # 解压并替换 frpc.exe
+          if (Test-Path frp) { Remove-Item frp -Recurse -Force }
           Expand-Archive frp.zip -DestinationPath frp -Force
-          Copy-Item -Path (Get-ChildItem -Recurse -Path frp -Filter frpc.exe).FullName -Destination . -Force
 
-      - name: Commit updated frpc.exe
+          $exe = Get-ChildItem -Recurse -Path frp -Filter frpc.exe | Select-Object -First 1
+          if (-not $exe) { throw "frpc.exe not found in extracted archive." }
+
+          Copy-Item $exe.FullName -Destination ./frpc.exe -Force
+
+      - name: Commit changes if any
+        shell: pwsh
         run: |
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
-          git add frpc.exe
-          git commit -m "Update frpc.exe to latest release"
-          git push
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 强制把 frpc.exe 加入（绕过 .gitignore）
+          git add -f frpc.exe
+
+          # 清理下载产物，避免误提交
+          git restore --staged frp.zip 2>$null
+          git restore --staged frp 2>$null
+          if (Test-Path frp.zip) { Remove-Item frp.zip -Force }
+          if (Test-Path frp) { Remove-Item frp -Recurse -Force }
+
+          if (git diff --cached --quiet) {
+            echo "No changes to commit."
+          } else {
+            $tag = (Invoke-RestMethod https://api.github.com/repos/fatedier/frp/releases/latest).tag_name
+            git commit -m "Update frpc.exe to $tag"
+            git push origin HEAD:main
+          }
