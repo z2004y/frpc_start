@@ -1,0 +1,37 @@
+name: Update frpc.exe
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"   # 每周一凌晨3点执行
+  workflow_dispatch:       # 允许手动触发
+
+jobs:
+  update-frpc:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Download latest FRP release
+        shell: pwsh
+        run: |
+          # 获取最新版本号
+          $latest = Invoke-RestMethod https://api.github.com/repos/fatedier/frp/releases/latest
+          $version = $latest.tag_name
+          Write-Output "Latest version: $version"
+
+          # 下载 Windows amd64 压缩包
+          $url = $latest.assets | Where-Object { $_.name -match "windows_amd64.zip" } | Select-Object -ExpandProperty browser_download_url
+          Invoke-WebRequest -Uri $url -OutFile frp.zip
+
+          # 解压并替换 frpc.exe
+          Expand-Archive frp.zip -DestinationPath frp -Force
+          Copy-Item -Path (Get-ChildItem -Recurse -Path frp -Filter frpc.exe).FullName -Destination . -Force
+
+      - name: Commit updated frpc.exe
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add frpc.exe
+          git commit -m "Update frpc.exe to latest release"
+          git push
