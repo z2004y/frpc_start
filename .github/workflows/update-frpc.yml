@@ -3,58 +3,83 @@ name: Update frpc.exe
 on:
   schedule:
     - cron: "0 3 * * 1"        # 每周一 03:00（UTC）运行
-  workflow_dispatch:
+  workflow_dispatch:           # 允许手动触发
 
 permissions:
-  contents: write               # 关键：允许写入仓库内容（commit/push）
+  contents: write              # 必须，允许提交到仓库
 
 jobs:
   update-frpc:
     runs-on: windows-latest
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0        # 保留历史，避免稀奇问题
+          fetch-depth: 0
           persist-credentials: true
 
       - name: Download latest FRP (windows_amd64)
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $latest = Invoke-RestMethod https://api.github.com/repos/fatedier/frp/releases/latest
-          $asset = $latest.assets | Where-Object { $_.name -match "windows_amd64\.zip$" } | Select-Object -First 1
-          if (-not $asset) { throw "Cannot find windows_amd64 asset in latest release." }
+          # 调用 GitHub API，获取最新 release
+          $headers = @{
+            "Authorization" = "Bearer $env:GH_TOKEN"
+            "User-Agent"    = "frpc-updater"
+            "Accept"        = "application/vnd.github+json"
+          }
+          $latest = Invoke-RestMethod -Headers $headers -Uri https://api.github.com/repos/fatedier/frp/releases/latest
+          $asset  = $latest.assets | Where-Object { $_.name -match "windows_amd64\.zip$" } | Select-Object -First 1
+          if (-not $asset) { throw "Cannot find windows_amd64 asset." }
 
           Write-Host "Latest tag: $($latest.tag_name)"
           Invoke-WebRequest -Uri $asset.browser_download_url -OutFile frp.zip
 
+          # 解压
           if (Test-Path frp) { Remove-Item frp -Recurse -Force }
           Expand-Archive frp.zip -DestinationPath frp -Force
 
           $exe = Get-ChildItem -Recurse -Path frp -Filter frpc.exe | Select-Object -First 1
-          if (-not $exe) { throw "frpc.exe not found in extracted archive." }
+          if (-not $exe) { throw "frpc.exe not found." }
 
-          Copy-Item $exe.FullName -Destination ./frpc.exe -Force
+          # 新旧 SHA256 对比
+          $tmpPath = Join-Path $env:RUNNER_TEMP "frpc_new.exe"
+          Copy-Item $exe.FullName -Destination $tmpPath -Force
 
-      - name: Commit changes if any
+          $oldHash = if (Test-Path ./frpc.exe) { (Get-FileHash ./frpc.exe -Algorithm SHA256).Hash } else { "" }
+          $newHash = (Get-FileHash $tmpPath -Algorithm SHA256).Hash
+
+          if ($oldHash -eq $newHash) {
+            Write-Host "frpc.exe 已是最新版本 ($($latest.tag_name))，跳过更新。"
+            echo "NO_CHANGE=true" >> $env:GITHUB_ENV
+          } else {
+            Write-Host "发现新版本，准备更新。"
+            Copy-Item $tmpPath -Destination ./frpc.exe -Force
+          }
+
+          # 清理临时文件
+          Remove-Item frp.zip -Force
+          Remove-Item frp -Recurse -Force
+          Remove-Item $tmpPath -Force
+
+      - name: Commit & Push changes
+        if: env.NO_CHANGE != 'true'
         shell: pwsh
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # 强制把 frpc.exe 加入（绕过 .gitignore）
+          # 强制跟踪（绕过 .gitignore）
           git add -f frpc.exe
 
-          # 清理下载产物，避免误提交
-          git restore --staged frp.zip 2>$null
-          git restore --staged frp 2>$null
-          if (Test-Path frp.zip) { Remove-Item frp.zip -Force }
-          if (Test-Path frp) { Remove-Item frp -Recurse -Force }
-
-          if (git diff --cached --quiet) {
-            echo "No changes to commit."
-          } else {
-            $tag = (Invoke-RestMethod https://api.github.com/repos/fatedier/frp/releases/latest).tag_name
-            git commit -m "Update frpc.exe to $tag"
-            git push origin HEAD:main
+          # 判断是否有 staged 改动
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "没有新的改动需要提交。"
+            exit 0
           }
+
+          $tag = (Invoke-RestMethod https://api.github.com/repos/fatedier/frp/releases/latest).tag_name
+          git commit -m "Update frpc.exe to $tag"
+          git push origin HEAD:main
